@@ -4,6 +4,7 @@
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-111827?logo=apple)](https://www.apple.com/macos/)
 [![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 Tracket watches the development signals developers already create—workspace activity, Git changes, connected coding tools, repositories, and deployments—and turns them into a focused path to launch. It keeps monitoring from the macOS menu bar after the main window closes, estimates project completion, and brings the latest progress back into one dashboard.
 
@@ -135,4 +136,6 @@ Tracket is an actively developed macOS MVP. Provider APIs and local tool formats
 
 ## License
 
-No open-source license has been granted yet. The source is public for demonstration and portfolio review.
+Copyright 2026 Mohamed Islem Bouazizi.
+
+Licensed under the [Apache License 2.0](LICENSE). You may use, modify, and distribute Tracket under the terms of that license.
