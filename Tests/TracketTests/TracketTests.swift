@@ -4,6 +4,169 @@ import XCTest
 @testable import Tracket
 
 final class TracketTests: XCTestCase {
+    func testAISettingsDefaultToPrivateLocalMode() {
+        let settings = AISettings()
+
+        XCTAssertEqual(settings.mode, .local)
+        XCTAssertEqual(settings.localModel, .qwenCoder7B)
+        XCTAssertEqual(settings.contextSharing, .metadataOnly)
+        XCTAssertFalse(settings.allowCloudFallback)
+    }
+
+    func testAISettingsAndConfiguredProvidersPersist() {
+        let suiteName = "TracketTests.AISettings.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var persistence = PersistenceStore(defaults: defaults)
+        var settings = AISettings()
+        settings.mode = .smartHybrid
+        settings.cloudProvider = .openRouter
+        settings.cloudModel = "example/model"
+        settings.contextSharing = .metadataAndDiff
+        settings.allowCloudFallback = true
+
+        persistence.saveAISettings(settings)
+        persistence.configuredAIProviders = [.openRouter, .deepSeek]
+
+        XCTAssertEqual(persistence.loadAISettings(), settings)
+        XCTAssertEqual(persistence.configuredAIProviders, [.openRouter, .deepSeek])
+    }
+
+    func testPlanDecoderExtractsAndValidatesJSON() throws {
+        let text = """
+        Here is the plan:
+        {"summary":"Ready to focus.","stage":"building","nextSuggestion":"Finish sign in.","completionPercent":52,"completionRationale":"The core path exists.","milestones":[{"title":"One","detail":"A","priority":"high","dueInDays":1},{"title":"Two","detail":"B","priority":"medium","dueInDays":2},{"title":"Three","detail":"C","priority":"low","dueInDays":3},{"title":"Four","detail":"D","priority":"high","dueInDays":4}]}
+        """
+
+        let plan = try decodePlan(text)
+
+        XCTAssertEqual(plan.stage, "building")
+        XCTAssertEqual(plan.completionPercent, 52)
+        XCTAssertEqual(plan.milestones.count, 4)
+    }
+
+    func testMeasuredCompletionRewardsDeploymentEvidence() {
+        var project = makeProject(lastActivityAt: Date(), commits: 2, statuses: [.done, .active, .todo])
+        let before = ProjectCompletionEstimator().estimate(project)
+        project.remoteURL = "https://github.com/example/app"
+        project.deploymentURL = "https://example.com"
+
+        XCTAssertGreaterThan(ProjectCompletionEstimator().estimate(project), before)
+    }
+
+    func testLocalModelRecoversCompletedDownloadWithoutReadyMarker() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TracketLocalModel-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelRoot = root.appendingPathComponent(LocalAIModel.qwenCoder7B.rawValue)
+        let repository = "models--mlx-community--Qwen2.5-Coder-7B-Instruct-4bit"
+        let commit = "0123456789abcdef0123456789abcdef01234567"
+        let refs = modelRoot.appendingPathComponent(repository).appendingPathComponent("refs")
+        let snapshot = modelRoot.appendingPathComponent(repository)
+            .appendingPathComponent("snapshots").appendingPathComponent(commit)
+        try FileManager.default.createDirectory(at: refs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        try commit.write(to: refs.appendingPathComponent("main"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snapshot.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snapshot.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([1, 2, 3]).write(to: snapshot.appendingPathComponent("model.safetensors"))
+        let service = LocalAIService(rootDirectory: root)
+
+        let state = await service.state(for: .qwenCoder7B)
+
+        guard case .ready = state else { return XCTFail("A complete cached snapshot should be recovered as ready.") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: modelRoot.appendingPathComponent(".tracket-ready").path))
+    }
+
+    func testLocalModelPartialDownloadCanBeDeleted() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TracketPartialModel-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelRoot = root.appendingPathComponent(LocalAIModel.qwenCoder7B.rawValue)
+        try FileManager.default.createDirectory(at: modelRoot, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 1_100_000).write(to: modelRoot.appendingPathComponent("partial.incomplete"))
+        let service = LocalAIService(rootDirectory: root)
+
+        let state = await service.state(for: .qwenCoder7B)
+        guard case .partial = state else { return XCTFail("Cached incomplete files should be shown as partial.") }
+
+        try await service.remove(.qwenCoder7B)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: modelRoot.path))
+    }
+
+    func testLocalModelWithMissingIndexedWeightShardIsNotReady() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TracketMissingShard-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelRoot = root.appendingPathComponent(LocalAIModel.qwenCoder7B.rawValue)
+        let repository = "models--mlx-community--Qwen2.5-Coder-7B-Instruct-4bit"
+        let commit = "0123456789abcdef0123456789abcdef01234567"
+        let refs = modelRoot.appendingPathComponent(repository).appendingPathComponent("refs")
+        let snapshot = modelRoot.appendingPathComponent(repository)
+            .appendingPathComponent("snapshots").appendingPathComponent(commit)
+        try FileManager.default.createDirectory(at: refs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        try commit.write(to: refs.appendingPathComponent("main"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snapshot.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snapshot.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data(repeating: 1, count: 1_100_000)
+            .write(to: snapshot.appendingPathComponent("model-00001-of-00002.safetensors"))
+        let index = ["weight_map": [
+            "layer.one": "model-00001-of-00002.safetensors",
+            "layer.two": "model-00002-of-00002.safetensors"
+        ]]
+        try JSONSerialization.data(withJSONObject: index)
+            .write(to: snapshot.appendingPathComponent("model.safetensors.index.json"))
+        let service = LocalAIService(rootDirectory: root)
+
+        let state = await service.state(for: .qwenCoder7B)
+
+        guard case .partial = state else { return XCTFail("A snapshot with a missing indexed shard must not be ready.") }
+    }
+
+    func testProjectAIWorkspacePersistsMemorySeparatelyForEachProject() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TracketAIWorkspaces-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ProjectAIWorkspaceStore(rootDirectory: root)
+        let firstID = UUID()
+        let secondID = UUID()
+        var first = ProjectAIWorkspace(projectID: firstID)
+        first.memory.summary = "Uses SwiftUI and Swift Package Manager."
+        first.memory.skills = [ProjectAISkill(name: "Testing", detail: "Run swift test.")]
+        first.append(ProjectChatMessage(role: .user, content: "How do I test it?"))
+        first.startNewSession()
+        var second = ProjectAIWorkspace(projectID: secondID)
+        second.memory.summary = "A separate TypeScript service."
+
+        try store.save(first)
+        try store.save(second)
+        let loaded = store.loadAll()
+
+        XCTAssertEqual(loaded[firstID]?.memory.summary, "Uses SwiftUI and Swift Package Manager.")
+        XCTAssertEqual(loaded[firstID]?.memory.skills.first?.name, "Testing")
+        XCTAssertEqual(loaded[firstID]?.sessions.count, 2)
+        XCTAssertEqual(loaded[secondID]?.memory.summary, "A separate TypeScript service.")
+        XCTAssertNotEqual(loaded[firstID]?.memory, loaded[secondID]?.memory)
+    }
+
+    func testProjectAIResponseUpdatesMemoryAndMergesSkills() {
+        let oldSkill = ProjectAISkill(name: "Build", detail: "Run the debug build.")
+        let memory = ProjectAIMemory(summary: "Old summary", skills: [oldSkill])
+        let response = decodeProjectChatResponse(
+            """
+            {"answer":"Use the release scheme.","memorySummary":"The release scheme is required for shipping.","skills":[{"name":"Build","detail":"Use the release scheme for shipping."},{"name":"Deploy","detail":"Run the packaging script."}]}
+            """,
+            previousMemory: memory
+        )
+
+        XCTAssertEqual(response.answer, "Use the release scheme.")
+        XCTAssertEqual(response.memorySummary, "The release scheme is required for shipping.")
+        XCTAssertEqual(response.skills.count, 2)
+        XCTAssertEqual(response.skills.first(where: { $0.name == "Build" })?.id, oldSkill.id)
+        XCTAssertEqual(response.skills.first(where: { $0.name == "Deploy" })?.detail, "Run the packaging script.")
+    }
+
     func testPersistenceResetRemovesOnlyTracketValues() {
         let suiteName = "TracketTests.Reset.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

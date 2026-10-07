@@ -12,6 +12,8 @@ struct PersistenceStore {
     private let connectionsKey = "tracket.connections.v1"
     private let oauthClientIDPrefix = "tracket.oauth.client-id."
     private let openAIKeyConfiguredKey = "tracket.openai-key-configured"
+    private let aiSettingsKey = "tracket.ai.settings.v1"
+    private let configuredAIProvidersKey = "tracket.ai.configured-providers"
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -59,6 +61,27 @@ struct PersistenceStore {
     var hasOpenAIKeyConfigured: Bool {
         get { defaults.bool(forKey: openAIKeyConfiguredKey) }
         set { defaults.set(newValue, forKey: openAIKeyConfiguredKey) }
+    }
+
+    func loadAISettings() -> AISettings {
+        guard let data = defaults.data(forKey: aiSettingsKey),
+              let settings = try? JSONDecoder().decode(AISettings.self, from: data) else {
+            return AISettings()
+        }
+        return settings
+    }
+
+    func saveAISettings(_ settings: AISettings) {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        defaults.set(data, forKey: aiSettingsKey)
+    }
+
+    var configuredAIProviders: Set<CloudAIProvider> {
+        get {
+            Set((defaults.array(forKey: configuredAIProvidersKey) as? [String] ?? [])
+                .compactMap(CloudAIProvider.init(rawValue:)))
+        }
+        set { defaults.set(newValue.map(\.rawValue).sorted(), forKey: configuredAIProvidersKey) }
     }
 
     var monitoringEnabled: Bool {

@@ -121,52 +121,238 @@ struct SettingsView: View {
         Surface {
             VStack(alignment: .leading, spacing: 17) {
                 sectionHeader(
-                    title: "OpenAI project coach",
-                    caption: "Generates a release-focused roadmap from project metadata.",
+                    title: "AI project coach",
+                    caption: "Run privately on this Mac, use your provider, or combine both.",
                     symbol: "sparkles",
                     tint: TracketTheme.accent
                 )
 
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(store.hasAPIKey ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
-                    Text(store.hasAPIKey ? "Connected" : "API key required")
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                    Text("Model: \(OpenAIService.model)")
-                        .font(.caption.monospaced())
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Execution mode").font(.subheadline.weight(.semibold))
+                    Picker("Execution mode", selection: aiModeBinding) {
+                        ForEach(AIExecutionMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(store.aiSettings.mode.detail)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                SecureField(store.hasAPIKey ? "Enter a replacement API key" : "OpenAI API key", text: $apiKey)
-                    .textFieldStyle(.roundedBorder)
+                if store.aiSettings.mode != .cloud {
+                    Divider()
+                    localModelSettings
+                }
 
-                HStack {
-                    Text("The key is stored in your Mac's Keychain and is never saved in project data.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if store.hasAPIKey {
-                        Button("Remove", role: .destructive) { store.removeAPIKey() }
-                    }
-                    Button("Save key") {
-                        store.saveAPIKey(apiKey)
-                        apiKey = ""
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if store.aiSettings.mode != .local {
+                    Divider()
+                    cloudProviderSettings
                 }
 
                 Divider()
-                Label(
-                    "Before a public release, route OpenAI requests through a small server so API credentials never ship inside the client.",
-                    systemImage: "shield.lefthalf.filled"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Information shared with AI").font(.subheadline.weight(.semibold))
+                    Picker("Information shared", selection: contextSharingBinding) {
+                        ForEach(AIContextSharing.allCases) { level in
+                            Text(level.title).tag(level)
+                        }
+                    }
+                    Text(store.aiSettings.contextSharing.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if store.aiSettings.mode == .smartHybrid {
+                        Toggle("Allow cloud fallback when local AI cannot produce a valid plan", isOn: cloudFallbackBinding)
+                        Text("This setting is explicit permission. Tracket never sends a request to the cloud while it is off.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
+    }
+
+    private var localModelSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Tracket Local").font(.headline)
+                    Text("This Mac has approximately \(store.physicalMemoryGB) GB memory.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Picker("Local model", selection: localModelBinding) {
+                    ForEach(LocalAIModel.allCases) { model in
+                        Text(model.title).tag(model)
+                    }
+                }
+                .frame(width: 230)
+            }
+
+            let model = store.aiSettings.localModel
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "cpu.fill")
+                    .foregroundStyle(store.physicalMemoryGB >= model.minimumMemoryGB ? Color.green : Color.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.title).font(.subheadline.weight(.semibold))
+                    Text("\(model.summary) Download: \(model.estimatedDownload); recommended memory: \(model.minimumMemoryGB) GB or more.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    localModelStatus(model)
+                }
+                Spacer()
+                localModelAction(model)
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private var cloudProviderSettings: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Text("Cloud provider").font(.headline)
+                Spacer()
+                Picker("Cloud provider", selection: cloudProviderBinding) {
+                    ForEach(CloudAIProvider.allCases) { provider in
+                        Text(provider.title).tag(provider)
+                    }
+                }
+                .frame(width: 230)
+            }
+
+            TextField("Model identifier", text: cloudModelBinding)
+                .textFieldStyle(.roundedBorder)
+            TextField("Base URL", text: baseURLBinding)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(store.configuredAIProviders.contains(store.aiSettings.cloudProvider) ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                Text(store.configuredAIProviders.contains(store.aiSettings.cloudProvider) ? "API key stored" : "API key required")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text(store.aiSettings.effectiveModel)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            SecureField("\(store.aiSettings.cloudProvider.title) API key", text: $apiKey)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Text("Keys are stored in your Mac's Keychain and never saved with project data.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if store.configuredAIProviders.contains(store.aiSettings.cloudProvider) {
+                    Button("Remove", role: .destructive) {
+                        store.removeCloudAPIKey(for: store.aiSettings.cloudProvider)
+                    }
+                }
+                Button("Save key") {
+                    store.saveCloudAPIKey(apiKey, for: store.aiSettings.cloudProvider)
+                    apiKey = ""
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func localModelStatus(_ model: LocalAIModel) -> some View {
+        switch store.localModelStates[model] ?? .notDownloaded {
+        case .notDownloaded:
+            Text("Not downloaded").font(.caption2).foregroundStyle(.secondary)
+        case .partial(let bytes):
+            Text("Downloaded files found · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)). Resume or delete them.")
+                .font(.caption2).foregroundStyle(.orange)
+        case .downloading(let progress):
+            ProgressView(value: progress) {
+                Text(progress >= 1 ? "Verifying model files…" : "Downloading \(Int(progress * 100))%")
+            }
+            .progressViewStyle(.linear)
+            .frame(maxWidth: 280)
+        case .ready(let bytes):
+            Text("Ready · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+                .font(.caption2).foregroundStyle(.green)
+        case .loading:
+            Text("Loading into memory…").font(.caption2).foregroundStyle(.secondary)
+        case .failed(let message):
+            Text(message).font(.caption2).foregroundStyle(.red).lineLimit(2)
+        }
+    }
+
+    @ViewBuilder
+    private func localModelAction(_ model: LocalAIModel) -> some View {
+        switch store.localModelStates[model] ?? .notDownloaded {
+        case .ready:
+            Button("Delete", role: .destructive) { store.removeLocalModel(model) }
+        case .partial:
+            HStack(spacing: 7) {
+                Button("Delete", role: .destructive) { store.removeLocalModel(model) }
+                Button("Resume") { store.downloadLocalModel(model) }
+                    .buttonStyle(.borderedProminent)
+            }
+        case .downloading:
+            Button("Cancel") { store.cancelLocalModelDownload(model) }
+        case .loading:
+            ProgressView().controlSize(.small)
+        case .notDownloaded, .failed:
+            Button("Download") { store.downloadLocalModel(model) }
+                .buttonStyle(.borderedProminent)
+                .disabled(store.physicalMemoryGB < model.minimumMemoryGB)
+        }
+    }
+
+    private var aiModeBinding: Binding<AIExecutionMode> {
+        Binding(get: { store.aiSettings.mode }, set: { value in
+            var settings = store.aiSettings; settings.mode = value; store.updateAISettings(settings)
+        })
+    }
+
+    private var localModelBinding: Binding<LocalAIModel> {
+        Binding(get: { store.aiSettings.localModel }, set: { value in
+            var settings = store.aiSettings; settings.localModel = value; store.updateAISettings(settings)
+        })
+    }
+
+    private var cloudProviderBinding: Binding<CloudAIProvider> {
+        Binding(get: { store.aiSettings.cloudProvider }, set: { value in
+            var settings = store.aiSettings
+            settings.cloudProvider = value
+            settings.cloudModel = value.defaultModel
+            settings.customBaseURL = value.defaultBaseURL
+            store.updateAISettings(settings)
+            apiKey = ""
+        })
+    }
+
+    private var cloudModelBinding: Binding<String> {
+        Binding(get: { store.aiSettings.cloudModel }, set: { value in
+            var settings = store.aiSettings; settings.cloudModel = value; store.updateAISettings(settings)
+        })
+    }
+
+    private var baseURLBinding: Binding<String> {
+        Binding(get: { store.aiSettings.effectiveBaseURL }, set: { value in
+            var settings = store.aiSettings; settings.customBaseURL = value; store.updateAISettings(settings)
+        })
+    }
+
+    private var contextSharingBinding: Binding<AIContextSharing> {
+        Binding(get: { store.aiSettings.contextSharing }, set: { value in
+            var settings = store.aiSettings; settings.contextSharing = value; store.updateAISettings(settings)
+        })
+    }
+
+    private var cloudFallbackBinding: Binding<Bool> {
+        Binding(get: { store.aiSettings.allowCloudFallback }, set: { value in
+            var settings = store.aiSettings; settings.allowCloudFallback = value; store.updateAISettings(settings)
+        })
     }
 
     private var notificationSection: some View {
@@ -208,7 +394,8 @@ struct SettingsView: View {
                     tint: .green
                 )
                 privacyRow("Project paths, roadmap state, and momentum stay on this Mac.")
-                privacyRow("Source code is not sent to OpenAI in this MVP; only the displayed project metadata is used for planning.")
+                privacyRow("AI receives only the context level selected above; relevant-source mode uses bounded excerpts, never the whole repository.")
+                privacyRow("Local AI runs through MLX on this Mac after an optional model download.")
                 privacyRow("The menu-bar monitor reads file timestamps and Git metadata, not file contents.")
                 privacyRow("Codex hooks record lifecycle and edit events without saving prompts, commands, or source code.")
                 privacyRow("Provider credentials are stored in Keychain; imported cloud projects store metadata and URLs, not source code.")
@@ -226,7 +413,7 @@ struct SettingsView: View {
                     tint: .red
                 )
 
-                Text("All tracked projects, folder links, activity history, connected services, credentials, and monitor settings will be forgotten. Source folders and cloud projects remain untouched.")
+                Text("All tracked projects, folder links, activity history, AI conversations and project memory, connected services, credentials, and monitor settings will be forgotten. Source folders and cloud projects remain untouched.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 

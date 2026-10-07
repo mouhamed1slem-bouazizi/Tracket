@@ -31,7 +31,13 @@ Tracket is designed around a simple loop:
 - Git branch, commit, working-tree, ahead/behind, push, and incoming-work detection.
 - “Since you were away” activity timeline.
 - Roadmaps, milestones, deadlines, momentum scoring, and launch-state tracking.
-- AI-generated project plans through OpenAI's Responses API.
+- Private on-device project planning through downloadable MLX models.
+- Local, cloud, and smart-hybrid AI modes with explicit cloud-fallback permission.
+- OpenAI, OpenRouter, Anthropic, DeepSeek, and custom OpenAI-compatible providers.
+- Project-aware AI chat with separate sessions, memory, and learned skills for every project.
+- Query-ranked repository context: project map, Git state, and focused source excerpts instead of whole-repository uploads.
+- Verified, resumable local-model downloads with model deletion and clean reinstallation controls.
+- An isolated local-AI helper process, so a model-runtime failure cannot terminate the Tracket interface.
 - Provider usage and rate-limit details when the connected service exposes them.
 - Local notifications for stalled work and upcoming milestones.
 - One-click reset that removes Tracket data, credentials, bookmarks, and linked accounts without deleting project folders or cloud resources.
@@ -51,7 +57,28 @@ Tracket is designed around a simple loop:
 | Vercel | Dynamic OAuth with PKCE | Projects and deployments |
 | Render | OAuth-protected hosted MCP | Workspaces and services |
 
-Credentials are stored in macOS Keychain. Tracket never asks users to paste provider API tokens into the app.
+Connection credentials are obtained through browser authorization and stored in macOS Keychain. Optional AI-provider API keys entered in Settings are also stored in Keychain and are never written to project files.
+
+## Project AI workspace
+
+Every project has an AI conversation panel at the bottom of its detail page. The active provider is selected in **Settings → Intelligence**, and Tracket prepares focused context from the selected project before answering.
+
+- **Local AI** keeps prompts, relevant source excerpts, and inference on the Mac.
+- **Cloud Provider** uses the configured OpenAI, OpenRouter, Anthropic, DeepSeek, or compatible endpoint and respects the selected context-sharing level.
+- **Smart Hybrid** prefers the installed local model and uses the cloud only when fallback is enabled.
+
+Conversation sessions, distilled memory, and learned project skills are stored separately for each project. Starting a new session loads that project's prior memory and skills without mixing data between projects. Removing a project or resetting Tracket removes its AI workspace data.
+
+## Local AI models
+
+Tracket currently supports the following Apple-silicon models:
+
+| Model | Recommended memory | Purpose |
+| --- | --- | --- |
+| Qwen2.5-Coder 7B Instruct (4-bit) | 16 GB or more | Default local coding assistant |
+| Devstral Small 2 (4-bit) | 32 GB or more | Larger local coding and repository reasoning model |
+
+Model installation is resumable and verifies the configuration, tokenizer, weights index, every required SafeTensors shard, and an actual runtime load before showing **Ready**. Models can be deleted at any time from Settings. The downloaded model files remain outside the application bundle in the user's Application Support data.
 
 ## Privacy model
 
@@ -59,8 +86,10 @@ Tracket is local-first and intentionally avoids surveillance-style tracking.
 
 - Project folders are accessed only after user approval.
 - Security-scoped bookmarks preserve approved folder access across launches.
-- OAuth credentials and the optional OpenAI API key are stored in Keychain.
-- AI planning sends project metadata visible in the interface, not repository source code.
+- OAuth credentials and optional AI-provider keys are stored in Keychain.
+- Local AI automatically reads only query-relevant project files and keeps them on-device. Cloud AI uses the context-sharing level selected by the user; the whole repository is never submitted.
+- Project conversations, memory, and learned skills remain isolated per project in Application Support.
+- Smart Hybrid never falls back to a cloud provider unless the user enables that permission.
 - The Codex event bridge records lifecycle metadata such as event name, project directory, session identifier, and tool—not prompts, command bodies, tool results, or source files.
 - Monitoring can be paused, connections can be removed individually, and all Tracket data can be reset from Settings.
 
@@ -68,8 +97,11 @@ Tracket is local-first and intentionally avoids surveillance-style tracking.
 
 - macOS 14 or newer
 - Xcode with a Swift 6 toolchain
+- The Xcode Metal toolchain component for packaging local MLX inference (`xcodebuild -downloadComponent MetalToolchain`)
 - GitHub CLI (`gh`) for GitHub browser authentication
-- An OpenAI API key only when AI-generated roadmaps are desired
+- Apple silicon for on-device MLX models; cloud-provider mode remains available without a local model
+- At least 16 GB memory is recommended for Qwen2.5-Coder 7B; Devstral Small 2 is offered on Macs with 32 GB or more
+- An API key only when Cloud Provider or Smart Hybrid cloud fallback is used
 
 ## Run locally
 
@@ -87,13 +119,16 @@ swift run Tracket --demo
 
 You can also open `Package.swift` directly in Xcode.
 
+`swift run Tracket` is convenient for UI and cloud-provider development. Use the packaging script below when testing local models because it also builds the isolated inference helper and bundles the required MLX Metal shader library.
+
 ## Build the macOS app
 
 ```bash
+xcodebuild -downloadComponent MetalToolchain
 sh scripts/package-app.sh
 ```
 
-The packaged application is written to `dist/Tracket-macOS.zip`. The script uses an installed Developer ID or Apple Development certificate when available and otherwise falls back to ad-hoc signing.
+The script writes `dist/Tracket.app` and `dist/Tracket-macOS.zip`. It builds the main app, the local-AI helper, and the MLX Metal shader library, then uses an installed Developer ID or Apple Development certificate when available and otherwise falls back to ad-hoc signing.
 
 For stable Keychain and folder-permission identity across builds, select a signing certificate explicitly:
 
@@ -108,7 +143,7 @@ sh scripts/package-app.sh
 swift test
 ```
 
-The test suite covers project discovery, local adapters, persistence reset, activity scoring, provider response parsing, OAuth credential compatibility, GitHub device-code parsing, and menu-bar lifecycle behavior.
+The test suite covers project discovery, local adapters, persistence reset, activity scoring, AI-provider response parsing, project-memory isolation, repository-context ranking, model-install validation, OAuth credential compatibility, GitHub device-code parsing, and menu-bar lifecycle behavior.
 
 ## Project structure
 
@@ -121,6 +156,7 @@ Sources/Tracket/
 └── Views/        SwiftUI dashboard, settings, project, and menu-bar views
 
 Sources/TracketHook/   Lightweight local event bridge
+Sources/TracketLocalAI/ Isolated MLX inference helper executable
 Tests/TracketTests/    Unit and integration tests
 Packaging/             macOS bundle metadata
 scripts/               Build and packaging utilities

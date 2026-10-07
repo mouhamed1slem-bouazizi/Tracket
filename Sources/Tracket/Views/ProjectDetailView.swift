@@ -7,6 +7,7 @@ struct ProjectDetailView: View {
     @State private var showingEditor = false
     @State private var showingLiveSheet = false
     @State private var showingDeleteConfirmation = false
+    @State private var chatDraft = ""
 
     private var isWorking: Bool { store.workingProjectID == project.id }
 
@@ -41,6 +42,7 @@ struct ProjectDetailView: View {
                         }
                         .frame(width: 300)
                     }
+                    projectAIChat
                 }
                 .padding(30)
                 .frame(maxWidth: 1_200, alignment: .leading)
@@ -379,6 +381,142 @@ struct ProjectDetailView: View {
         }
     }
 
+    private var projectAIChat: some View {
+        let workspace = store.projectAIWorkspace(for: project.id)
+        let session = workspace.currentSession
+        let isReplying = store.aiChattingProjectIDs.contains(project.id)
+        return Surface {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "bubble.left.and.text.bubble.right.fill")
+                        .font(.title2)
+                        .foregroundStyle(TracketTheme.brandGradient)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Talk with your project AI")
+                            .font(.title3.bold())
+                        Text("Uses \(store.activeAIProviderTitle) and keeps memory separate for \(project.name).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if workspace.sessions.count > 1 {
+                        Menu {
+                            ForEach(workspace.sessions.reversed()) { item in
+                                Button {
+                                    store.selectProjectAISession(projectID: project.id, sessionID: item.id)
+                                } label: {
+                                    HStack {
+                                        Text(item.startedAt.formatted(date: .abbreviated, time: .shortened))
+                                        if item.id == workspace.currentSessionID { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label("History", systemImage: "clock.arrow.circlepath")
+                        }
+                        .disabled(isReplying)
+                    }
+                    Button {
+                        store.startNewProjectAISession(projectID: project.id)
+                    } label: {
+                        Label("New session", systemImage: "plus.bubble")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(session.messages.isEmpty || isReplying)
+                }
+
+                HStack(spacing: 8) {
+                    Label(store.activeAIProviderTitle, systemImage: "cpu")
+                    Label(store.activeAIChatContextTitle, systemImage: "doc.text.magnifyingglass")
+                    if !workspace.memory.summary.isEmpty || !workspace.memory.skills.isEmpty {
+                        Label("Memory loaded", systemImage: "brain.head.profile.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if !workspace.memory.summary.isEmpty || !workspace.memory.skills.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if !workspace.memory.summary.isEmpty {
+                                Text(workspace.memory.summary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                            if !workspace.memory.skills.isEmpty {
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 110))], alignment: .leading, spacing: 7) {
+                                    ForEach(workspace.memory.skills) { skill in
+                                        Text(skill.name)
+                                            .font(.caption2.weight(.semibold))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 5)
+                                            .background(.quaternary, in: Capsule())
+                                            .help(skill.detail)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.top, 8)
+                    } label: {
+                        Text("Project memory and learned skills")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                }
+
+                Divider()
+
+                if session.messages.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Ask about architecture, bugs, implementation choices, testing, or the fastest path to deployment.")
+                            .font(.subheadline)
+                        Text("A new session starts with this project's saved memory and skills, without mixing information from other projects.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 8)
+                } else {
+                    VStack(spacing: 12) {
+                        ForEach(Array(session.messages.suffix(30))) { message in
+                            ProjectAIMessageBubble(message: message)
+                        }
+                        if isReplying {
+                            HStack(spacing: 9) {
+                                ProgressView().controlSize(.small)
+                                Text("Reading the project and thinking…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
+                }
+
+                HStack(alignment: .bottom, spacing: 10) {
+                    TextField("Ask anything about this project…", text: $chatDraft, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(2...7)
+                        .onSubmit(sendChatMessage)
+                    Button(action: sendChatMessage) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TracketTheme.accent)
+                    .disabled(chatDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isReplying)
+                }
+            }
+        }
+    }
+
+    private func sendChatMessage() {
+        let message = chatDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty, !store.aiChattingProjectIDs.contains(project.id) else { return }
+        chatDraft = ""
+        store.sendProjectAIMessage(message, projectID: project.id)
+    }
+
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
@@ -418,6 +556,40 @@ struct ProjectDetailView: View {
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
+        }
+    }
+}
+
+private struct ProjectAIMessageBubble: View {
+    let message: ProjectChatMessage
+
+    var body: some View {
+        HStack(alignment: .top) {
+            if message.role == .user { Spacer(minLength: 80) }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(message.role == .user ? "You" : "Project AI")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                messageText
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            }
+            .padding(12)
+            .background(
+                message.role == .user ? TracketTheme.accent.opacity(0.14) : Color.secondary.opacity(0.09),
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+            )
+            if message.role == .assistant { Spacer(minLength: 50) }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var messageText: some View {
+        if let attributed = try? AttributedString(markdown: message.content) {
+            Text(attributed)
+        } else {
+            Text(message.content)
         }
     }
 }

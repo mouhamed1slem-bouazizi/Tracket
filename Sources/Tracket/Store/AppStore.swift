@@ -25,10 +25,16 @@ final class AppStore: ObservableObject {
     @Published var isBackgroundScanning = false
     @Published var connections: [DeveloperConnection]
     @Published var isConnectingProvider: ConnectionProvider?
+    @Published var aiSettings: AISettings
+    @Published var configuredAIProviders: Set<CloudAIProvider>
+    @Published var localModelStates: [LocalAIModel: LocalModelState] = [:]
+    @Published var projectAIWorkspaces: [UUID: ProjectAIWorkspace]
+    @Published var aiChattingProjectIDs: Set<UUID> = []
 
     private var persistence: PersistenceStore
+    private var projectAIWorkspaceStore: ProjectAIWorkspaceStore
     private let keychain = KeychainService()
-    private let ai = OpenAIService()
+    private let ai = AIService()
     private let notifications = NotificationService()
     private let folderAccess = FolderAccessService()
     private let hookInbox = HookInboxService()
@@ -45,9 +51,14 @@ final class AppStore: ObservableObject {
     private let localToolUsage = LocalToolUsageService()
     private let oauth = OAuthService()
     private var monitoringTask: Task<Void, Never>?
+    private var modelDownloadTasks: [LocalAIModel: Task<Void, Never>] = [:]
 
-    init(persistence: PersistenceStore = PersistenceStore()) {
+    init(
+        persistence: PersistenceStore = PersistenceStore(),
+        projectAIWorkspaceStore: ProjectAIWorkspaceStore = ProjectAIWorkspaceStore()
+    ) {
         self.persistence = persistence
+        self.projectAIWorkspaceStore = projectAIWorkspaceStore
         self.projects = persistence.loadProjects()
         self.activities = persistence.loadActivities()
         self.monitoringEnabled = persistence.monitoringEnabled
@@ -55,10 +66,16 @@ final class AppStore: ObservableObject {
         self.monitorIntervalMinutes = persistence.monitorIntervalMinutes
         self.lastMonitorAt = persistence.lastMonitorAt
         self.connections = persistence.loadConnections()
+        self.aiSettings = persistence.loadAISettings()
+        self.projectAIWorkspaces = projectAIWorkspaceStore.loadAll()
+        var configuredAIProviders = persistence.configuredAIProviders
+        if persistence.hasOpenAIKeyConfigured { configuredAIProviders.insert(.openAI) }
+        self.configuredAIProviders = configuredAIProviders
         // Do not read Keychain during launch. Ad-hoc development builds can have
         // a changing code requirement, which would otherwise display a password
         // prompt every time Tracket starts.
         self.hasAPIKey = persistence.hasOpenAIKeyConfigured
+        self.persistence.configuredAIProviders = configuredAIProviders
         folderAccess.restoreAccess(for: projects.filter(\.isLocalProject).map(\.path))
 
         if ProcessInfo.processInfo.arguments.contains("--demo"), projects.isEmpty {
@@ -68,6 +85,7 @@ final class AppStore: ObservableObject {
 
         Task { @MainActor [weak self] in
             self?.startMonitoring()
+            await self?.refreshLocalModelStates()
         }
     }
 
@@ -188,22 +206,95 @@ final class AppStore: ObservableObject {
     }
 
     func generateAIPlan(for project: TracketProject) {
-        guard let key = keychain.loadAPIKey() else {
-            selection = .settings
-            alertMessage = "Add your OpenAI API key in Settings, then generate the plan again."
-            return
-        }
-
         workingProjectID = project.id
         Task {
             do {
-                let plan = try await ai.createPlan(for: project, apiKey: key)
+                let key = cloudAPIKey(for: aiSettings.cloudProvider)
+                let plan = try await ai.createPlan(for: project, settings: aiSettings, cloudAPIKey: key)
                 apply(plan, to: project.id)
             } catch {
+                if case AIProviderError.missingAPIKey = error { selection = .settings }
+                if case AIProviderError.localModelRequired = error { selection = .settings }
                 alertMessage = error.localizedDescription
             }
             workingProjectID = nil
         }
+    }
+
+    func projectAIWorkspace(for projectID: UUID) -> ProjectAIWorkspace {
+        projectAIWorkspaces[projectID] ?? ProjectAIWorkspace(projectID: projectID)
+    }
+
+    var activeAIProviderTitle: String {
+        switch aiSettings.mode {
+        case .local:
+            "Local · \(aiSettings.localModel.title)"
+        case .cloud:
+            "\(aiSettings.cloudProvider.title) · \(aiSettings.effectiveModel)"
+        case .smartHybrid:
+            "Smart hybrid · \(aiSettings.localModel.title) first"
+        }
+    }
+
+    var activeAIChatContextTitle: String {
+        aiSettings.mode == .local
+            ? "Relevant project files · private on this Mac"
+            : aiSettings.contextSharing.title
+    }
+
+    func sendProjectAIMessage(_ message: String, projectID: UUID) {
+        let question = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty,
+              !aiChattingProjectIDs.contains(projectID),
+              let project = projects.first(where: { $0.id == projectID }) else { return }
+
+        var workspace = projectAIWorkspace(for: projectID)
+        let sessionID = workspace.currentSessionID
+        workspace.append(ProjectChatMessage(role: .user, content: question), to: sessionID)
+        persistProjectAIWorkspace(workspace)
+        aiChattingProjectIDs.insert(projectID)
+
+        Task {
+            defer { aiChattingProjectIDs.remove(projectID) }
+            do {
+                let key = cloudAPIKey(for: aiSettings.cloudProvider)
+                let response = try await ai.chat(
+                    for: project,
+                    workspace: workspace,
+                    question: question,
+                    settings: aiSettings,
+                    cloudAPIKey: key
+                )
+                var updated = projectAIWorkspace(for: projectID)
+                updated.append(ProjectChatMessage(role: .assistant, content: response.answer), to: sessionID)
+                updated.memory = ProjectAIMemory(
+                    summary: response.memorySummary,
+                    skills: response.skills,
+                    updatedAt: Date()
+                )
+                persistProjectAIWorkspace(updated)
+            } catch {
+                if case AIProviderError.missingAPIKey = error { selection = .settings }
+                if case AIProviderError.localModelRequired = error { selection = .settings }
+                alertMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func startNewProjectAISession(projectID: UUID) {
+        guard !aiChattingProjectIDs.contains(projectID) else { return }
+        var workspace = projectAIWorkspace(for: projectID)
+        if workspace.currentSession.messages.isEmpty { return }
+        workspace.startNewSession()
+        persistProjectAIWorkspace(workspace)
+    }
+
+    func selectProjectAISession(projectID: UUID, sessionID: UUID) {
+        guard !aiChattingProjectIDs.contains(projectID) else { return }
+        var workspace = projectAIWorkspace(for: projectID)
+        guard workspace.sessions.contains(where: { $0.id == sessionID }) else { return }
+        workspace.currentSessionID = sessionID
+        persistProjectAIWorkspace(workspace)
     }
 
     func isConnected(_ provider: ConnectionProvider) -> Bool {
@@ -383,17 +474,27 @@ final class AppStore: ObservableObject {
         if project.isLocalProject { folderAccess.forget(path: project.path) }
         projects.removeAll { $0.id == project.id }
         activities.removeAll { $0.projectID == project.id }
+        projectAIWorkspaces.removeValue(forKey: project.id)
+        try? projectAIWorkspaceStore.remove(projectID: project.id)
         selection = .dashboard
         save()
     }
 
     func saveAPIKey(_ key: String) {
+        saveCloudAPIKey(key, for: .openAI)
+    }
+
+    func saveCloudAPIKey(_ key: String, for provider: CloudAIProvider) {
         do {
-            try keychain.saveAPIKey(key)
-            hasAPIKey = true
-            persistence.hasOpenAIKeyConfigured = true
-            alertMessage = "API key saved securely in Keychain."
-            if hasAPIKey {
+            try keychain.saveSecret(key, account: aiCredentialAccount(provider))
+            configuredAIProviders.insert(provider)
+            persistence.configuredAIProviders = configuredAIProviders
+            if provider == .openAI {
+                hasAPIKey = true
+                persistence.hasOpenAIKeyConfigured = true
+            }
+            alertMessage = "\(provider.title) API key saved securely in Keychain."
+            if aiSettings.mode != .local {
                 let pending = projects
                     .filter { $0.stage != .live && $0.aiCompletionPercent == nil }
                     .map(\.id)
@@ -405,17 +506,82 @@ final class AppStore: ObservableObject {
     }
 
     func removeAPIKey() {
+        removeCloudAPIKey(for: .openAI)
+    }
+
+    func removeCloudAPIKey(for provider: CloudAIProvider) {
         do {
-            try keychain.deleteAPIKey()
-            hasAPIKey = false
-            persistence.hasOpenAIKeyConfigured = false
+            try keychain.deleteSecret(account: aiCredentialAccount(provider))
+            configuredAIProviders.remove(provider)
+            persistence.configuredAIProviders = configuredAIProviders
+            if provider == .openAI {
+                hasAPIKey = false
+                persistence.hasOpenAIKeyConfigured = false
+            }
         } catch {
             alertMessage = error.localizedDescription
         }
     }
 
+    func updateAISettings(_ settings: AISettings) {
+        aiSettings = settings
+        persistence.saveAISettings(settings)
+        Task { await refreshLocalModelStates() }
+    }
+
+    func downloadLocalModel(_ model: LocalAIModel) {
+        guard modelDownloadTasks[model] == nil else { return }
+        localModelStates[model] = .downloading(0)
+        modelDownloadTasks[model] = Task {
+            defer { modelDownloadTasks[model] = nil }
+            do {
+                try await ai.download(model) { [weak self] progress in
+                    Task { @MainActor in self?.localModelStates[model] = .downloading(progress) }
+                }
+                await refreshLocalModelStates()
+                alertMessage = "\(model.title) is ready for private, offline planning."
+            } catch is CancellationError {
+                await refreshLocalModelStates()
+            } catch {
+                if Task.isCancelled {
+                    await refreshLocalModelStates()
+                } else {
+                    localModelStates[model] = .failed(error.localizedDescription)
+                    alertMessage = "Model download failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func cancelLocalModelDownload(_ model: LocalAIModel) {
+        modelDownloadTasks[model]?.cancel()
+    }
+
+    func removeLocalModel(_ model: LocalAIModel) {
+        Task {
+            do {
+                try await ai.remove(model)
+                await refreshLocalModelStates()
+            } catch {
+                alertMessage = "Could not remove \(model.title): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func refreshLocalModelStates() async {
+        for model in LocalAIModel.allCases {
+            localModelStates[model] = await ai.localState(for: model)
+        }
+    }
+
+    var physicalMemoryGB: Int {
+        Int(ProcessInfo.processInfo.physicalMemory / 1_073_741_824)
+    }
+
     func resetApplication() {
         do {
+            for task in modelDownloadTasks.values { task.cancel() }
+            modelDownloadTasks = [:]
             for project in projects {
                 notifications.removeNudge(for: project)
             }
@@ -423,6 +589,7 @@ final class AppStore: ObservableObject {
             let removedKeychainItems = try keychain.deleteAllSecrets()
             folderAccess.reset()
             persistence.resetAll()
+            try projectAIWorkspaceStore.reset()
 
             projects = []
             activities = []
@@ -433,6 +600,11 @@ final class AppStore: ObservableObject {
             workingProjectID = nil
             isConnectingProvider = nil
             hasAPIKey = false
+            aiSettings = AISettings()
+            configuredAIProviders = []
+            localModelStates = [:]
+            projectAIWorkspaces = [:]
+            aiChattingProjectIDs = []
             notificationsEnabled = false
             monitoringEnabled = true
             remoteSyncEnabled = true
@@ -441,6 +613,10 @@ final class AppStore: ObservableObject {
             alertMessage = removedKeychainItems
                 ? "Tracket was reset. Projects, folder links, connected accounts, credentials, and preferences were removed."
                 : "Tracket was reset and no longer references any credentials. macOS retained an older protected Keychain item; you can remove it in Keychain Access without reconnecting it to Tracket."
+            Task {
+                for model in LocalAIModel.allCases { try? await ai.remove(model) }
+                await refreshLocalModelStates()
+            }
         } catch {
             alertMessage = "Tracket could not finish resetting: \(error.localizedDescription)"
         }
@@ -908,13 +1084,15 @@ final class AppStore: ObservableObject {
 
     private func apply(_ plan: AIProjectPlan, to projectID: UUID) {
         update(projectID) { project in
+            let measuredCompletion = ProjectCompletionEstimator().estimate(project)
+            let blendedCompletion = Int((Double(plan.completionPercent) * 0.65 + Double(measuredCompletion) * 0.35).rounded())
             project.aiSummary = plan.summary
             project.nextSuggestion = plan.nextSuggestion
             if project.stage != .live {
                 project.stage = ProjectStage(rawValue: plan.stage) ?? project.stage
             }
-            project.aiCompletionPercent = project.stage == .live ? 100 : min(99, max(0, plan.completionPercent))
-            project.aiCompletionRationale = plan.completionRationale
+            project.aiCompletionPercent = project.stage == .live ? 100 : min(99, max(0, blendedCompletion))
+            project.aiCompletionRationale = "AI assessment \(plan.completionPercent)% · measured signals \(measuredCompletion)%. \(plan.completionRationale)"
             project.aiAssessedAt = Date()
             project.roadmap = plan.milestones.enumerated().map { index, milestone in
                 RoadmapItem(
@@ -944,8 +1122,25 @@ final class AppStore: ObservableObject {
         persistence.saveConnections(connections)
     }
 
+    private func persistProjectAIWorkspace(_ workspace: ProjectAIWorkspace) {
+        projectAIWorkspaces[workspace.projectID] = workspace
+        do {
+            try projectAIWorkspaceStore.save(workspace)
+        } catch {
+            alertMessage = "Could not save this project's AI memory: \(error.localizedDescription)"
+        }
+    }
+
     private func credentialAccount(_ provider: ConnectionProvider) -> String {
         "provider.\(provider.rawValue).credential"
+    }
+
+    private func aiCredentialAccount(_ provider: CloudAIProvider) -> String {
+        provider == .openAI ? "openai-api-key" : "ai.provider.\(provider.rawValue).api-key"
+    }
+
+    private func cloudAPIKey(for provider: CloudAIProvider) -> String? {
+        keychain.loadSecret(account: aiCredentialAccount(provider))
     }
 
     private func saveOAuthCredential(_ credential: OAuthCredential, provider: ConnectionProvider) throws {
@@ -1284,11 +1479,12 @@ final class AppStore: ObservableObject {
     }
 
     private func assessImportedProjects(_ ids: [UUID]) async {
-        guard let key = keychain.loadAPIKey() else { return }
+        let key = cloudAPIKey(for: aiSettings.cloudProvider)
+        if aiSettings.mode == .cloud, key == nil { return }
         for id in ids {
             guard let project = projects.first(where: { $0.id == id }), project.stage != .live else { continue }
             do {
-                let plan = try await ai.createPlan(for: project, apiKey: key)
+                let plan = try await ai.createPlan(for: project, settings: aiSettings, cloudAPIKey: key)
                 apply(plan, to: id)
             } catch {
                 // Import remains successful; the user can retry AI assessment from the project page.
